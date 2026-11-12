@@ -45,18 +45,17 @@ mkdir -p dist
 build_one() {
     local arch=$1
     local out="build-$arch"
-    local archflags
+    local -a archflags
 
     if [ "$arch" = "universal" ]; then
-        archflags="ARCHS=arm64\ x86_64"
+        archflags=(ARCHS="arm64 x86_64")
     else
-        archflags="ARCHS=$arch VALID_ARCHS=$arch"
+        archflags=(ARCHS="$arch" VALID_ARCHS="$arch")
     fi
 
     echo "=== $arch: app ==="
-    # shellcheck disable=SC2086
     xcodebuild -project jitouch/Jitouch/Jitouch.xcodeproj -scheme Jitouch -configuration Release \
-        $archflags ONLY_ACTIVE_ARCH=NO \
+        "${archflags[@]}" ONLY_ACTIVE_ARCH=NO \
         CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$DEV_TEAM" \
         CODE_SIGN_IDENTITY="$APP_ID" PROVISIONING_PROFILE_SPECIFIER="" \
         OTHER_CODE_SIGN_FLAGS="--timestamp --options runtime" \
@@ -65,9 +64,8 @@ build_one() {
     echo "=== $arch: preference pane ==="
     rm -rf prefpane/Jitouch.app
     cp -R "$out/Release/Jitouch.app" prefpane/Jitouch.app
-    # shellcheck disable=SC2086
     xcodebuild -project prefpane/Jitouch.xcodeproj -target Jitouch -configuration Release \
-        $archflags ONLY_ACTIVE_ARCH=NO \
+        "${archflags[@]}" ONLY_ACTIVE_ARCH=NO \
         CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$DEV_TEAM" \
         CODE_SIGN_IDENTITY="$APP_ID" PROVISIONING_PROFILE_SPECIFIER="" \
         OTHER_CODE_SIGN_FLAGS="--timestamp --options runtime" \
