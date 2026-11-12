@@ -15,11 +15,14 @@
     Gesture *gesture;
     NSMenu *theMenu;
     NSStatusItem *theItem;
+    NSTimer *permissionTimer;
+    BOOL permissionAlertShown;
 }
 
 @property (assign) IBOutlet NSWindow *window;
 
 - (void)reload;
+- (void)grantAccessibilityPermission:(id)sender;
 
 @end
 

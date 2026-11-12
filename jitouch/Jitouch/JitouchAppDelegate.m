@@ -38,16 +38,7 @@ CGKeyCode keyMap[128]; // for dvorak support
 
 - (void)showIcon {
     theMenu = [[[NSMenu alloc] initWithTitle:@"Contextual Menu"] autorelease];
-
-    if (enAll)
-        [theMenu insertItemWithTitle:@"Turn Jitouch Off" action:@selector(switchChange:) keyEquivalent:@"" atIndex:0];
-    else
-        [theMenu insertItemWithTitle:@"Turn Jitouch On" action:@selector(switchChange:) keyEquivalent:@"" atIndex:0];
-
-    //[theMenu insertItem:[NSMenuItem separatorItem] atIndex:1];
-    [theMenu insertItemWithTitle:@"Open Preferences..." action:@selector(preferences:) keyEquivalent:@"" atIndex:1];
-    [theMenu insertItem:[NSMenuItem separatorItem] atIndex:2];
-    [theMenu insertItemWithTitle:@"Quit Jitouch" action:@selector(quit:) keyEquivalent:@"" atIndex:3];
+    [self rebuildMenu];
 
     NSStatusBar *bar = [NSStatusBar systemStatusBar];
     theItem = [bar statusItemWithLength:NSVariableStatusItemLength];
@@ -55,6 +46,24 @@ CGKeyCode keyMap[128]; // for dvorak support
     [self updateIconImage];
     [theItem setHighlightMode:YES];
     [theItem setMenu:theMenu];
+}
+
+// The permission item only exists while Jitouch is not trusted, so the menu is
+// rebuilt instead of being edited by index.
+- (void)rebuildMenu {
+    if (theMenu == nil) {
+        return;
+    }
+    [theMenu removeAllItems];
+    [theMenu addItemWithTitle:(enAll ? @"Turn Jitouch Off" : @"Turn Jitouch On")
+                       action:@selector(switchChange:) keyEquivalent:@""];
+    [theMenu addItemWithTitle:@"Open Preferences..." action:@selector(preferences:) keyEquivalent:@""];
+    if (!AXIsProcessTrusted()) {
+        [theMenu addItemWithTitle:@"Grant Accessibility Permission…"
+                           action:@selector(grantAccessibilityPermission:) keyEquivalent:@""];
+    }
+    [theMenu addItem:[NSMenuItem separatorItem]];
+    [theMenu addItemWithTitle:@"Quit Jitouch" action:@selector(quit:) keyEquivalent:@""];
 }
 
 - (void)hideIcon {
@@ -109,11 +118,7 @@ CGKeyCode keyMap[128]; // for dvorak support
         [self hideIcon];
     }
     if (theItem) {
-        if (enAll) {
-            [[theMenu itemAtIndex:0] setTitle:@"Turn Jitouch Off"];
-        } else {
-            [[theMenu itemAtIndex:0] setTitle:@"Turn Jitouch On"];
-        }
+        [self rebuildMenu];
         [self updateIconImage];
     }
 }
@@ -147,8 +152,94 @@ CGKeyCode keyMap[128]; // for dvorak support
 #pragma mark - Initialization
 
 
-- (void)checkAXAPI {
+#pragma mark - Accessibility permission
+
+// The pane was called "Accessibility" up to macOS 15; macOS 26 and later fold it
+// into "Device Control and Data Access". The anchor still works on both.
+static NSString *const kJitouchPrivacySettingsURL =
+    @"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility";
+
+- (void)recordPermissionState {
+    [Settings setKey:@"axTrusted" withInt:(AXIsProcessTrusted() ? 1 : 0)];
+}
+
+- (void)openAccessibilitySettings {
+    // Registers Jitouch in the pane (and shows the system prompt the first time),
+    // then deep-links straight to the right page.
     AXIsProcessTrustedWithOptions((CFDictionaryRef)@{(id)kAXTrustedCheckOptionPrompt: @(YES)});
+    NSURL *url = [NSURL URLWithString:kJitouchPrivacySettingsURL];
+    if (url) {
+        [[NSWorkspace sharedWorkspace] openURL:url];
+    }
+}
+
+- (void)grantAccessibilityPermission:(id)sender {
+    [self openAccessibilitySettings];
+    [self startPermissionWatch];
+}
+
+- (void)checkAXAPI {
+    [self recordPermissionState];
+    if (AXIsProcessTrusted()) {
+        return;
+    }
+    // Let the status item appear before showing a modal alert on top of it.
+    [NSTimer scheduledTimerWithTimeInterval:0.8 target:self selector:@selector(showPermissionAlert:) userInfo:nil repeats:NO];
+    [self startPermissionWatch];
+}
+
+- (void)showPermissionAlert:(NSTimer *)timer {
+    if (permissionAlertShown || AXIsProcessTrusted()) {
+        return;
+    }
+    permissionAlertShown = YES;
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    [alert setMessageText:@"Jitouch needs Accessibility permission"];
+    [alert setInformativeText:
+        @"Without it Jitouch cannot read trackpad touches, so no gesture will work.\n\n"
+        @"Open System Settings › Privacy & Security, then turn Jitouch on:\n"
+        @"• macOS 26 and later: “Device Control and Data Access”\n"
+        @"• macOS 15 and earlier: “Accessibility”\n\n"
+        @"Jitouch keeps checking and starts working as soon as the switch is on — no restart needed."];
+    [alert setAlertStyle:NSAlertStyleWarning];
+    [alert addButtonWithTitle:@"Open System Settings"];
+    [alert addButtonWithTitle:@"Later"];
+    [NSApp activateIgnoringOtherApps:YES];
+    NSModalResponse response = [alert runModal];
+    [alert release];
+
+    if (response == NSAlertFirstButtonReturn) {
+        [self openAccessibilitySettings];
+    }
+}
+
+- (void)startPermissionWatch {
+    if (permissionTimer != nil) {
+        return;
+    }
+    permissionTimer = [[NSTimer scheduledTimerWithTimeInterval:1.0
+                                                        target:self
+                                                      selector:@selector(permissionTick:)
+                                                      userInfo:nil
+                                                       repeats:YES] retain];
+}
+
+- (void)permissionTick:(NSTimer *)timer {
+    if (!AXIsProcessTrusted()) {
+        return;
+    }
+    [timer invalidate];
+    [permissionTimer release];
+    permissionTimer = nil;
+
+    NSLog(@"Accessibility permission granted; reloading gestures.");
+    [self recordPermissionState];
+    [self refreshMenu];
+    // The event tap could not be created at launch, so build it now instead of
+    // asking the user to restart Jitouch.
+    [gesture reload];
+    [Settings noteSettingsUpdated2];
 }
 
 /*

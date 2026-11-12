@@ -282,8 +282,70 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
 
 }
 
+- (BOOL)jitouchHasAccessibilityPermission {
+    Boolean trusted = false;
+    CFPropertyListRef value = CFPreferencesCopyAppValue(CFSTR("axTrusted"), appID);
+    if (value) {
+        int flag = 0;
+        if (CFGetTypeID(value) == CFNumberGetTypeID() &&
+            CFNumberGetValue((CFNumberRef)value, kCFNumberIntType, &flag)) {
+            trusted = (flag != 0);
+        }
+        CFRelease(value);
+    }
+    return trusted;
+}
+
+- (void)showPermissionGuidanceIfNeeded {
+    static BOOL guidanceShown = NO;
+    // Only speak up when Jitouch is actually running and reports itself as
+    // untrusted; a stale preference while the agent is stopped is not a
+    // permission problem.
+    if (guidanceShown || ![self jitouchIsRunning] || [self jitouchHasAccessibilityPermission]) {
+        return;
+    }
+    guidanceShown = YES;
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    [alert setMessageText:@"Jitouch has no Accessibility permission"];
+    [alert setInformativeText:
+        @"Gestures stay inactive until Jitouch is allowed to control the computer.\n\n"
+        @"In System Settings › Privacy & Security turn Jitouch on under\n"
+        @"• “Device Control and Data Access” (macOS 26 and later), or\n"
+        @"• “Accessibility” (macOS 15 and earlier).\n\n"
+        @"Jitouch notices the change by itself — switching back here afterwards is enough."];
+    [alert setAlertStyle:NSAlertStyleWarning];
+    [alert addButtonWithTitle:@"Open System Settings"];
+    [alert addButtonWithTitle:@"Later"];
+
+    NSWindow *window = [[self mainView] window];
+    if (window) {
+        [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+            if (response == NSAlertFirstButtonReturn) {
+                AXIsProcessTrustedWithOptions((CFDictionaryRef)@{(id)kAXTrustedCheckOptionPrompt: @(YES)});
+                NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility"];
+                if (url) {
+                    [[NSWorkspace sharedWorkspace] openURL:url];
+                }
+            }
+        }];
+    } else {
+        if ([alert runModal] == NSAlertFirstButtonReturn) {
+            AXIsProcessTrustedWithOptions((CFDictionaryRef)@{(id)kAXTrustedCheckOptionPrompt: @(YES)});
+        }
+    }
+    [alert release];
+}
+
 - (void)willSelect {
-    BOOL trusted = AXIsProcessTrustedWithOptions((CFDictionaryRef)@{(id)kAXTrustedCheckOptionPrompt: @(YES)});
+    // The pane used to ask for the host app's permission on every visit, which is
+    // why the "asking for permissions" prompt kept reappearing (issue #83).
+    static BOOL promptedForHostPermission = NO;
+    BOOL trusted = AXIsProcessTrusted();
+    if (!trusted && !promptedForHostPermission) {
+        promptedForHostPermission = YES;
+        AXIsProcessTrustedWithOptions((CFDictionaryRef)@{(id)kAXTrustedCheckOptionPrompt: @(YES)});
+    }
 
     if (trusted && !eventKeyboard) {
         CGEventMask eventMask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp);
@@ -293,6 +355,8 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
         CFRunLoopSourceRef runLoopSource = CFMachPortCreateRunLoopSource( kCFAllocatorDefault, eventKeyboard, 0);
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, kCFRunLoopCommonModes);
     }
+
+    [self showPermissionGuidanceIfNeeded];
 }
 
 - (void)willUnselect {
