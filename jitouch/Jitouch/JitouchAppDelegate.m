@@ -164,8 +164,8 @@ static NSString *const kJitouchPrivacySettingsURL =
 }
 
 - (void)openAccessibilitySettings {
-    // Registers Jitouch in the pane (and shows the system prompt the first time),
-    // then deep-links straight to the right page.
+    // Showing the system prompt is what registers Jitouch in the pane: macOS adds
+    // the app to the list itself, so the user only has to flip the switch.
     AXIsProcessTrustedWithOptions((CFDictionaryRef)@{(id)kAXTrustedCheckOptionPrompt: @(YES)});
     NSURL *url = [NSURL URLWithString:kJitouchPrivacySettingsURL];
     if (url) {
@@ -183,35 +183,11 @@ static NSString *const kJitouchPrivacySettingsURL =
     if (AXIsProcessTrusted()) {
         return;
     }
-    // Let the status item appear before showing a modal alert on top of it.
-    [NSTimer scheduledTimerWithTimeInterval:0.8 target:self selector:@selector(showPermissionAlert:) userInfo:nil repeats:NO];
+    // No custom alert: the native prompt already explains itself, is localized,
+    // and its "Open System Settings" button lands on the right pane with Jitouch
+    // pre-registered. We open that pane as well so the switch is one click away.
+    [self openAccessibilitySettings];
     [self startPermissionWatch];
-}
-
-- (void)showPermissionAlert:(NSTimer *)timer {
-    if (permissionAlertShown || AXIsProcessTrusted()) {
-        return;
-    }
-    permissionAlertShown = YES;
-
-    NSAlert *alert = [[NSAlert alloc] init];
-    [alert setMessageText:@"Jitouch needs Accessibility permission"];
-    [alert setInformativeText:
-        @"Without it Jitouch cannot read trackpad touches, so no gesture will work.\n\n"
-        @"Open System Settings › Privacy & Security, then turn Jitouch on:\n"
-        @"• macOS 26 and later: “Device Control and Data Access”\n"
-        @"• macOS 15 and earlier: “Accessibility”\n\n"
-        @"Jitouch keeps checking and starts working as soon as the switch is on — no restart needed."];
-    [alert setAlertStyle:NSAlertStyleWarning];
-    [alert addButtonWithTitle:@"Open System Settings"];
-    [alert addButtonWithTitle:@"Later"];
-    [NSApp activateIgnoringOtherApps:YES];
-    NSModalResponse response = [alert runModal];
-    [alert release];
-
-    if (response == NSAlertFirstButtonReturn) {
-        [self openAccessibilitySettings];
-    }
 }
 
 - (void)startPermissionWatch {

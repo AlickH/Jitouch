@@ -16,7 +16,6 @@
     NSMenu *theMenu;
     NSStatusItem *theItem;
     NSTimer *permissionTimer;
-    BOOL permissionAlertShown;
 }
 
 @property (assign) IBOutlet NSWindow *window;
