@@ -134,6 +134,15 @@ static int moveResizeFlag, shouldExitMoveResize;
 static float twoFingersDistance = 100.0f;
 static BOOL trackpadHasTwoFingers;
 static NSDate *lastTwoFingerDate;
+// When the two-finger state first became true. A click is only swallowed while
+// that gesture is *starting*; keeping it latched for as long as a thumb rests
+// on the trackpad made clicks stop working (issues #56 and #77).
+static NSDate *twoFingersSince;
+static const NSTimeInterval twoFingerClickWindow = 0.12;
+// If no touch frame arrived for this long, the latched state is stale: the
+// fingers are gone (or the device stopped reporting) and must not keep
+// suppressing clicks.
+static const NSTimeInterval twoFingerStaleTimeout = 0.60;
 static NSDate *lastThreeFingerDate;
 
 // suppress four-finger tap if pinky-to-index or index-to-pinky gestures were triggered
@@ -217,11 +226,14 @@ static bool familyIsMagicTrackpad(int familyID) {
     return FALSE;
 }
 
-static void turnOffTrackpad() {
+static void turnOffTrackpad(void) {
     trackpadNFingers = 0;
+    trackpadHasTwoFingers = FALSE;
+    twoFingersSince = nil;
+    lastTwoFingerDate = nil;
 }
 
-static void turnOffMagicMouse() {
+static void turnOffMagicMouse(void) {
     middleClickFlag = 0;
     magicMouseThreeFingerFlag = 0;
     simulating = 0;
@@ -230,7 +242,7 @@ static void turnOffMagicMouse() {
     [cursorWindow orderOut:nil];
 }
 
-static void turnOffCharacters() {
+static void turnOffCharacters(void) {
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
     [gestureWindow clear];
     [gestureWindow orderOut:nil];
@@ -239,7 +251,7 @@ static void turnOffCharacters() {
     isMouseRecognizing = 0;
 }
 
-void turnOffGestures() {
+void turnOffGestures(void) {
     turnOffTrackpad();
     turnOffMagicMouse();
     turnOffCharacters();
@@ -278,25 +290,37 @@ static void getMousePosition(CGFloat *x, CGFloat *y) {
     *y = ourLoc.y;
 }
 
-static CFTypeRef getForemostApp() {
-    CFTypeRef focusedAppRef;
-    if (systemWideElement && AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedApplicationAttribute, &focusedAppRef) != kAXErrorSuccess) {
+static CFTypeRef getForemostApp(void) {
+    // focusedAppRef must be initialized: when the accessibility API is not
+    // available (systemWideElement == NULL) the old code fell through with an
+    // uninitialized pointer and crashed on the first AX call below.
+    CFTypeRef focusedAppRef = NULL;
+    if (systemWideElement) {
+        if (AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedApplicationAttribute, &focusedAppRef) != kAXErrorSuccess) {
+            focusedAppRef = NULL;
+        }
+    }
+    if (focusedAppRef == NULL) {
         NSRunningApplication *frontmostApplication = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (frontmostApplication == nil) {
+            return NULL;
+        }
         focusedAppRef = AXUIElementCreateApplication([frontmostApplication processIdentifier]);
         if (focusedAppRef == NULL) {
             return NULL;
         }
     }
-    CFTypeRef focusedWindowRef;
+    CFTypeRef focusedWindowRef = NULL;
 
     // does this code belong here?
-    CFTypeRef titleRef;
+    CFTypeRef titleRef = NULL;
     if (AXUIElementCopyAttributeValue(focusedAppRef, kAXTitleAttribute, &titleRef) == kAXErrorSuccess) {
         if (
             [(NSString*)titleRef isEqualToString:@"Notification Center"] ||
             [(NSString*)titleRef isEqualToString:@"Control Center"]
         ) {
             CFRelease(titleRef);
+            CFRelease(focusedAppRef);
             return NULL;
         }
         CFRelease(titleRef);
@@ -310,26 +334,41 @@ static CFTypeRef getForemostApp() {
     return NULL;
 }
 
-static void getWindowPos(CFTypeRef winRef, CGFloat *x, CGFloat *y) {
-    CFTypeRef positionRef;
-    if (winRef && AXUIElementCopyAttributeValue(winRef, kAXPositionAttribute, &positionRef) == kAXErrorSuccess) {
-        CGPoint pos;
-        AXValueGetValue((AXValueRef)positionRef, kAXValueCGPointType, &pos);
+// Both getters always write their out parameters: the callers used to read
+// uninitialized stack values whenever the accessibility query failed, which
+// made window gestures act on garbage geometry.
+static BOOL getWindowPos(CFTypeRef winRef, CGFloat *x, CGFloat *y) {
+    *x = 0;
+    *y = 0;
+    CFTypeRef positionRef = NULL;
+    if (!winRef || AXUIElementCopyAttributeValue(winRef, kAXPositionAttribute, &positionRef) != kAXErrorSuccess || positionRef == NULL) {
+        return NO;
+    }
+    CGPoint pos = CGPointZero;
+    BOOL ok = AXValueGetValue((AXValueRef)positionRef, kAXValueCGPointType, &pos);
+    if (ok) {
         *x = pos.x;
         *y = pos.y;
-        CFRelease(positionRef);
     }
+    CFRelease(positionRef);
+    return ok;
 }
 
-static void getWindowSize(CFTypeRef winRef, CGFloat *w, CGFloat *h) {
-    CFTypeRef sizeRef;
-    if (winRef && AXUIElementCopyAttributeValue(winRef, kAXSizeAttribute, &sizeRef) == kAXErrorSuccess) {
-        CGSize size;
-        AXValueGetValue((AXValueRef)sizeRef, kAXValueCGSizeType, &size);
+static BOOL getWindowSize(CFTypeRef winRef, CGFloat *w, CGFloat *h) {
+    *w = 0;
+    *h = 0;
+    CFTypeRef sizeRef = NULL;
+    if (!winRef || AXUIElementCopyAttributeValue(winRef, kAXSizeAttribute, &sizeRef) != kAXErrorSuccess || sizeRef == NULL) {
+        return NO;
+    }
+    CGSize size = CGSizeZero;
+    BOOL ok = AXValueGetValue((AXValueRef)sizeRef, kAXValueCGSizeType, &size);
+    if (ok) {
         *w = size.width;
         *h = size.height;
-        CFRelease(sizeRef);
     }
+    CFRelease(sizeRef);
+    return ok;
 }
 
 static void setWindowPos(CFTypeRef window, CGFloat x, CGFloat y) {
@@ -362,7 +401,7 @@ static int setWindowSize2(CFTypeRef window, CGFloat x, CGFloat y, CGFloat baseX,
     getWindowSize(window, &appW, &appH);
     return setWindowSize(window, appW+x-baseX, appH+y-baseY);
 }
-static void maximizeForemostWindow() {
+static void maximizeForemostWindow(void) {
     CFTypeRef winRef = getForemostApp();
     if (winRef) {
         CFTypeRef zoomButton;
@@ -373,7 +412,7 @@ static void maximizeForemostWindow() {
         CFRelease(winRef);
     }
 }
-static void minimizeForemostWindow() {
+static void minimizeForemostWindow(void) {
     CFTypeRef winRef = getForemostApp();
     if (winRef) {
         CFTypeRef minButton;
@@ -408,9 +447,11 @@ static void maximizeWindow(CFTypeRef window, int pos) {
     NSPoint origin = scr.origin;
     NSSize size = scr.size;
 
-    CGFloat appW, appH, appX, appY;
-    getWindowSize(window, &appW, &appH);
-    getWindowPos(window, &appX, &appY);
+    CGFloat appW = 0, appH = 0, appX = 0, appY = 0;
+    if (!getWindowSize(window, &appW, &appH) || !getWindowPos(window, &appX, &appY)) {
+        if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Could not read window geometry; skipping maximize");
+        return;
+    }
     SizeHistoryKey *key = [[SizeHistoryKey alloc] initWithKey:window];
     SizeHistory *sh = [sizeHistoryDict objectForKey:key];
     if (pos == 0) {
@@ -432,7 +473,7 @@ static void maximizeWindow(CFTypeRef window, int pos) {
             setWindowPos(window, origin.x + size.width / 2, [[screens objectAtIndex:0] frame].size.height - origin.y - size.height);
             setWindowSize(window, size.width / 2, size.height);
          }
-        CGFloat appW2, appH2, appX2, appY2;
+        CGFloat appW2 = 0, appH2 = 0, appX2 = 0, appY2 = 0;
         getWindowSize(window, &appW2, &appH2);
         getWindowPos(window, &appX2, &appY2);
 
@@ -461,12 +502,12 @@ static NSString* nameOfAxui(CFTypeRef ref) {
 }
 
 static CFTypeRef activateWindowAtPosition(CGFloat x, CGFloat y) {
-    AXUIElementRef focusedElement;
-    CFTypeRef windowRef, tmp;
+    AXUIElementRef focusedElement = NULL;
+    CFTypeRef windowRef = NULL, tmp = NULL;
     pid_t theTgtAppPID = 0;
     ProcessSerialNumber theTgtAppPSN = {0, 0};
 
-    if (systemWideElement && AXUIElementCopyElementAtPosition(systemWideElement, x, y, &focusedElement) == kAXErrorSuccess) {
+    if (systemWideElement && AXUIElementCopyElementAtPosition(systemWideElement, x, y, &focusedElement) == kAXErrorSuccess && focusedElement) {
         // Catch app such as TextMate that doesn't provide accessibilty interface
         if (AXUIElementCopyAttributeValue(focusedElement, kAXRoleAttribute, &tmp) != kAXErrorSuccess) {
             if (AXUIElementGetPid(focusedElement, &theTgtAppPID) == kAXErrorSuccess &&
@@ -544,22 +585,22 @@ static void findTabGroup2(CFTypeRef windowRef, float cx, float cy) {
     [cursorWindow setFrameOrigin:NSMakePoint(cx - 31, scr.size.height - tabY - 20)];
 }
 
-static int selectSafariTab() {
+static int selectSafariTab(void) {
     CGFloat x, y;
     int ret = 0;
     getMousePosition(&x, &y);
-    AXUIElementRef focusedElement;
+    AXUIElementRef focusedElement = NULL;
     CFTypeRef windowRef = NULL;
     pid_t theTgtAppPID = 0;
     ProcessSerialNumber theTgtAppPSN = {0, 0};
 
-    if (systemWideElement && AXUIElementCopyElementAtPosition(systemWideElement, x, y, &focusedElement) == kAXErrorSuccess) {
+    if (systemWideElement && AXUIElementCopyElementAtPosition(systemWideElement, x, y, &focusedElement) == kAXErrorSuccess && focusedElement) {
         if (AXUIElementGetPid(focusedElement, &theTgtAppPID) == kAXErrorSuccess &&
             GetProcessForPID(theTgtAppPID, &theTgtAppPSN) == noErr) {
 
             CFStringRef processName = NULL;
             CopyProcessName(&theTgtAppPSN, &processName);
-            if (CFStringCompare(processName, CFSTR("Safari"), 0) == kCFCompareEqualTo) {
+            if (processName && CFStringCompare(processName, CFSTR("Safari"), 0) == kCFCompareEqualTo) {
 
                 if (focusedElement && AXUIElementCopyAttributeValue(focusedElement, kAXWindowAttribute, &windowRef) != kAXErrorSuccess)
                     windowRef = focusedElement;
@@ -570,12 +611,14 @@ static int selectSafariTab() {
             }
             CFSafeRelease(processName);
         }
-        CFRelease(focusedElement);
+        if (focusedElement) {
+            CFRelease(focusedElement);
+        }
     }
     return ret;
 }
 
-static CFTypeRef axuiUnderMouse() {
+static CFTypeRef axuiUnderMouse(void) {
     CGFloat x, y;
     AXUIElementRef focusedElement = nil;
     getMousePosition(&x, &y);
@@ -584,7 +627,7 @@ static CFTypeRef axuiUnderMouse() {
     return focusedElement;
 }
 
-static BOOL isMouseOnEmptySpace() {
+static BOOL isMouseOnEmptySpace(void) {
     BOOL ret = NO;
     CFTypeRef axui = axuiUnderMouse();
     NSString *application = nameOfAxui(axui);
@@ -974,7 +1017,7 @@ static void doCommand(NSString *gesture, int device) {
     CFSafeRelease(axui);
 }
 
-static void setCursorWindowAtMouse() {
+static void setCursorWindowAtMouse(void) {
     CGEventRef ourEvent = CGEventCreate(NULL);
     CGPoint location = CGEventGetUnflippedLocation(ourEvent);
     CFRelease(ourEvent);
@@ -2015,10 +2058,14 @@ static int trackpadCallback(MTDeviceRef device, Finger *data, int nFingers, doub
         twoFingersDistance = 100;
     }
     if (twoFingersDistance < 0.3f && fabs([lastThreeFingerDate timeIntervalSinceNow]) > 0.05) {
+        if (!trackpadHasTwoFingers) {
+            twoFingersSince = [NSDate date];
+        }
         trackpadHasTwoFingers = TRUE;
         lastTwoFingerDate = [NSDate date];
     } else {
         trackpadHasTwoFingers = FALSE;
+        twoFingersSince = nil;
     }
 
     static int thumbId = -1;
@@ -2929,10 +2976,34 @@ static void multitouchDeviceRemoved(void* refCon, io_iterator_t iterator) {
 
 #pragma mark - CGEventCallback
 
+// Seconds since the last touch frame that had two close fingers. Returns
+// INFINITY when nothing was ever reported (the old code used the nil-object
+// result of 0.0, which swallowed the very first click after launch).
+static double secondsSinceLastTwoFingerFrame(void) {
+    if (lastTwoFingerDate == nil) {
+        return INFINITY;
+    }
+    return fabs([lastTwoFingerDate timeIntervalSinceNow]);
+}
+
 static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
     if (type == kCGEventLeftMouseDown) {
-        double timeInterval = fabs([lastTwoFingerDate timeIntervalSinceNow]);
-        bool suppress = trackpadHasTwoFingers || timeInterval < 0.05;
+        double timeInterval = secondsSinceLastTwoFingerFrame();
+        // Drop latched state when the touch device went quiet, otherwise a
+        // resting thumb or a missed final frame keeps every click suppressed
+        // until the app is restarted (issues #56, #77).
+        if (trackpadHasTwoFingers && timeInterval > twoFingerStaleTimeout) {
+            trackpadHasTwoFingers = FALSE;
+            twoFingersSince = nil;
+            if (logLevel >= LOG_LEVEL_DEBUG)
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{NSLog(@"Cleared stale two-finger state (%.2fs since last frame)", timeInterval);});
+        }
+        double twoFingerAge = twoFingersSince ? fabs([twoFingersSince timeIntervalSinceNow]) : INFINITY;
+        // While two fingers are down, only swallow the click that belongs to
+        // starting the gesture; otherwise swallow a click that follows the
+        // fingers being lifted.
+        bool suppress = trackpadHasTwoFingers ? (twoFingerAge < twoFingerClickWindow)
+                                              : (timeInterval < 0.05);
         if (suppress) {
             if (logLevel >= LOG_LEVEL_DEBUG)
                 dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{NSLog(@"Suppressed MouseDown with %d fingers d=%f t=%f", trackpadNFingers, twoFingersDistance, timeInterval);});
@@ -3082,7 +3153,7 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
         CGEventType nType = CGEventGetType(event);
         static int freePass = 0;
 
-        CGEventType mouseDown, mouseUp, mouseDrag;
+        CGEventType mouseDown = kCGEventNull, mouseUp = kCGEventNull, mouseDrag = kCGEventNull;
         if (charRegMouseButton == 0) {
             mouseDown = kCGEventOtherMouseDown;
             mouseUp = kCGEventOtherMouseUp;
@@ -3171,7 +3242,12 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
     if (eventTap != nil) {
         CGEventTapEnable(eventTap, true);
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
-        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, kCFRunLoopCommonModes);
+        if (runLoopSource) {
+            CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, kCFRunLoopCommonModes);
+            // The run loop keeps its own reference; leaking the source piled up
+            // one more copy every time the tap had to be recreated.
+            CFRelease(runLoopSource);
+        }
     }
 
     return eventTap;
@@ -3333,7 +3409,7 @@ CFMutableArrayRef deviceList;
 
 #pragma mark - Character Recognizer
 
-static void initNormPdf() {
+static void initNormPdf(void) {
     float mn = 10, mx = -1;
     float lo = 0.5, hi = 1;
     for (int i = -100; i <= 100; i++) {
@@ -3374,7 +3450,7 @@ static void setDegreeSpan(DegreeSpan *ds, float deg, float span) {
     ds->span = span * PI / 180.0f;
 }
 
-static void initChars() {
+static void initChars(void) {
     int c2 = 0;
     nChars = 0;
 
@@ -3887,7 +3963,7 @@ static const char *finalizeStep(float x1, float y1, float x2, float y2, float to
     return chars[out].ch;
 }
 
-static void clearStep() {
+static void clearStep(void) {
     for (int i = 0; i < nChars; i++) {
         chars[i].step = 0;
         chars[i].score = 0;
