@@ -27,7 +27,10 @@ cd "$(dirname "$0")/.."
 : "${APP_ID:?set APP_ID to your Developer ID Application identity}"
 : "${INSTALLER_ID:?set INSTALLER_ID to your Developer ID Installer identity}"
 
-VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" prefpane/Info.plist 2>/dev/null || echo 0.0.0)
+# The Info.plist keeps $(MARKETING_VERSION) as a build setting, so ask the project
+# rather than reading the file, otherwise the package version stays an expression.
+VERSION=$(xcodebuild -project prefpane/Jitouch.xcodeproj -target Jitouch -configuration Release \
+    -showBuildSettings 2>/dev/null | awk '/^ *MARKETING_VERSION = /{print $3; exit}')
 VERSION=${VERSION:-0.0.0}
 NOTARIZE=${NOTARIZE:-0}
 TARGETS=${1:-all}
