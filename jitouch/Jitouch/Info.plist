@@ -27,7 +27,7 @@
 	<key>LSMinimumSystemVersion</key>
 	<string>${MACOSX_DEPLOYMENT_TARGET}</string>
 	<key>NSAppleEventsUsageDescription</key>
-	<string></string>
+	<string>Jitouch sends Apple events to your browser to switch, open and close tabs when you perform a gesture.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2021 Supasorn Suwajanakorn and Sukolsak Sakshuwong. All rights reserved.</string>
 	<key>NSMainNibFile</key>
