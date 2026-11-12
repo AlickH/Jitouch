@@ -54,7 +54,7 @@ CFMachPortRef eventTap;
 
         [self enUpdated];
         if (enAll) {
-            [self loadJitouchLaunchAgent];
+            [self ensureJitouchRunning];
         }
     } else if (sender == cbShowIcon) {
         int value = [sender state] == NSControlStateValueOn ? 1: 0;
@@ -124,118 +124,48 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
     return event;
 }
 
-- (void)removeJitouchFromLoginItems{
-    LSSharedFileListRef loginListRef = LSSharedFileListCreate(NULL, kLSSharedFileListSessionLoginItems, NULL);
-    if (loginListRef) {
-        // delete all shortcuts to jitouch in the login items
-        UInt32 seedValue;
-        NSArray *loginItemsArray = (NSArray *)LSSharedFileListCopySnapshot(loginListRef, &seedValue);
-        for (id item in loginItemsArray) {
-            LSSharedFileListItemRef itemRef = (LSSharedFileListItemRef)item;
-            CFURLRef thePath;
-            if (LSSharedFileListItemResolve(itemRef, 0, (CFURLRef*) &thePath, NULL) == noErr) {
-                NSRange range = [[(NSURL*)thePath path] rangeOfString:@"Jitouch"];
-                if (range.location != NSNotFound)
-                    LSSharedFileListItemRemove(loginListRef, itemRef);
-            }
-        }
-        [loginItemsArray release];
-        CFRelease(loginListRef);
+// Jitouch.app registers its own launch agent through SMAppService. The pane only
+// has to make sure the app is running; registration happens on the app's side
+// because SMAppService resolves the bundle of the calling process, which here is
+// System Settings.
+- (NSURL *)jitouchAppURL {
+    return [[[self bundle] bundleURL] URLByAppendingPathComponent:@"Contents/Resources/Jitouch.app"];
+}
+
+// Previous releases installed ~/Library/LaunchAgents/com.jitouch.Jitouch.plist.
+// Stop that job and drop the file once, otherwise it would launch a second job
+// with the same label as the SMAppService one.
+- (BOOL)removeLegacyLaunchAgent {
+    NSString *plistPath = [@"~/Library/LaunchAgents/com.jitouch.Jitouch.plist" stringByExpandingTildeInPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
+        return NO;
     }
+    NSString *job = [NSString stringWithFormat:@"gui/%d/com.jitouch.Jitouch.agent", getuid()];
+    NSTask *bootout = [NSTask launchedTaskWithLaunchPath:@"/bin/launchctl"
+                                               arguments:[NSArray arrayWithObjects:@"bootout", job, nil]];
+    [bootout waitUntilExit];
+    // bootout only signals the job; give the old process a moment to go away so the
+    // relaunch below starts one instance instead of racing a dying one.
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:3.0];
+    while ([self jitouchIsRunning] && [deadline timeIntervalSinceNow] > 0.0) {
+        [NSThread sleepForTimeInterval:0.1];
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:plistPath error:NULL];
+    return YES;
 }
 
-- (NSString *)generateJitouchLaunchAgent {
-    NSString *pathToUs = [[self bundle] bundlePath];
-    NSString *home = NSHomeDirectory();
-    NSString *launchAgentFmt = @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-"<plist version=\"1.0\">\n"
-"<dict>\n"
-"    <key>Label</key>\n"
-"    <string>com.jitouch.Jitouch.agent</string>\n"
-"    <key>Program</key>\n"
-"    <string>%@/Contents/Resources/Jitouch.app/Contents/MacOS/Jitouch</string>\n"
-"    <key>RunAtLoad</key>\n"
-"    <true/>\n"
-"    <key>KeepAlive</key>\n"
-"    <true/>\n"
-"    <key>ProcessType</key>\n"
-"    <string>Interactive</string>\n"
-"    <key>StandardErrorPath</key>\n"
-"    <string>%@/Library/Logs/com.jitouch.Jitouch.log</string>\n"
-"    <key>StandardOutPath</key>\n"
-"    <string>/dev/null</string>\n"
-"    <key>Umask</key>\n"
-"    <integer>63</integer>\n"
-"</dict>\n"
-"</plist>";
-    NSString *launchAgent = [NSString stringWithFormat:launchAgentFmt, pathToUs, home];
-    return launchAgent;
-}
-
-- (void)loadJitouchLaunchAgent {
-    NSString *plistPath = [@"~/Library/LaunchAgents/com.jitouch.Jitouch.plist" stringByStandardizingPath];
-    NSArray *loadArgs = [NSArray arrayWithObjects:@"load",
-                         plistPath,
-                         nil];
-    NSTask *loadTask = [NSTask launchedTaskWithLaunchPath:@"/bin/launchctl" arguments:loadArgs];
-    [loadTask waitUntilExit];
-}
-
-- (void)unloadJitouchLaunchAgent {
-    NSString *plistPath = [@"~/Library/LaunchAgents/com.jitouch.Jitouch.plist" stringByStandardizingPath];
-    NSArray *unloadArgs = [NSArray arrayWithObjects:@"unload",
-                           plistPath,
-                           nil];
-    NSTask *unloadTask = [NSTask launchedTaskWithLaunchPath:@"/bin/launchctl" arguments:unloadArgs];
-    [unloadTask waitUntilExit];
-}
-
-- (void)addJitouchLaunchAgent {
-    NSString *launchAgent = [self generateJitouchLaunchAgent];
-    NSString *plistPath = [@"~/Library/LaunchAgents/com.jitouch.Jitouch.plist" stringByStandardizingPath];
-    NSString *launchAgentPath = [@"~/Library/LaunchAgents" stringByStandardizingPath];
-    NSError *error;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    // exit if the LaunchAgent plist already matches
-    if ([fm fileExistsAtPath:plistPath] &&
-        [launchAgent isEqualToString:
-         [NSString stringWithContentsOfFile:plistPath encoding:NSUTF8StringEncoding error:&error]
-        ]) {
+- (void)ensureJitouchRunning {
+    BOOL stoppedLegacyAgent = [self removeLegacyLaunchAgent];
+    if (!stoppedLegacyAgent && [self jitouchIsRunning]) {
         return;
     }
-    // create the LaunchAgents directory
-    BOOL isDir;
-    BOOL exists = [fm fileExistsAtPath:launchAgentPath isDirectory:&isDir];
-    if (!exists) {
-        BOOL success = [fm createDirectoryAtPath:launchAgentPath withIntermediateDirectories:NO attributes:nil error:&error];
-        if (!success || error) {
-            NSLog(@"Error creating LaunchAgents directory at %@: %@", launchAgentPath, [error localizedDescription]);
-        } else {
-            NSLog(@"Created the LaunchAgents directory at %@", launchAgentPath);
-        }
-    } else if (!isDir) {
-        NSLog(@"Error creating LaunchAgent at %@: ~/Library/LaunchAgents is not a directory.", plistPath);
-    }
-    // unload the LaunchAgent plist if it exists
-    [self unloadJitouchLaunchAgent];
-
-    // write the LaunchAgent plist
-    [launchAgent writeToFile:plistPath atomically:YES encoding:NSUTF8StringEncoding error:&error];
-    if (error) {
-        NSLog(@"Error creating LaunchAgent at %@: %@", plistPath, [error localizedDescription]);
-    }
-    else {
-        NSLog(@"Updated LaunchAgent at %@", plistPath);
-    }
-
-    // in case an older Jitouch is still around
-    [self removeJitouchFromLoginItems];
-    [self killAllJitouchs];
-
-    [self loadJitouchLaunchAgent];
-
-    NSLog(@"Reloaded LaunchAgent at %@", plistPath);
+    // Jitouch.app takes over from here: it registers the launch agent and exits, and
+    // launchd runs the registered instance.
+    NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
+    configuration.createsNewApplicationInstance = YES;
+    [[NSWorkspace sharedWorkspace] openApplicationAtURL:[self jitouchAppURL]
+                                          configuration:configuration
+                                      completionHandler:nil];
 }
 
 - (void)mainViewDidLoad {
@@ -262,7 +192,7 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
         [self killAllJitouchs];
         running = NO;
     }
-    [self addJitouchLaunchAgent];
+    [self ensureJitouchRunning];
 
 
     NSInteger tabIndex;

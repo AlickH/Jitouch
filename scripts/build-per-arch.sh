@@ -88,6 +88,7 @@ build_one() {
         prefpane/distribution.xml > "build/pkg-$arch/distribution.xml"
 
     pkgbuild --root "$stage" --component-plist prefpane/components.plist \
+        --scripts scripts/pkg-scripts \
         --identifier com.jitouch.Jitouch --version "$VERSION" \
         --install-location /Library/PreferencePanes \
         --sign "$INSTALLER_ID" --timestamp \

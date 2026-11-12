@@ -12,6 +12,7 @@
 #import "CursorWindow.h"
 #import <Carbon/Carbon.h>
 #import <CoreFoundation/CFPreferences.h>
+#import <ServiceManagement/ServiceManagement.h>
 #import "SystemPreferences.h"
 
 CursorWindow *cursorWindow;
@@ -21,13 +22,56 @@ CGKeyCode keyMap[128]; // for dvorak support
 
 @synthesize window;
 
-- (void)unloadJitouchLaunchAgent {
-    NSString *plistPath = [@"~/Library/LaunchAgents/com.jitouch.Jitouch.plist" stringByStandardizingPath];
-    NSArray *unloadArgs = [NSArray arrayWithObjects:@"unload",
-                           plistPath,
-                           nil];
-    NSTask *unloadTask = [NSTask launchedTaskWithLaunchPath:@"/bin/launchctl" arguments:unloadArgs];
-    [unloadTask waitUntilExit];
+#pragma mark - Login item
+
+// The launch agent lives in Contents/Library/LaunchAgents inside this bundle and is
+// registered through SMAppService, so launchd owns it instead of Jitouch writing a
+// plist into ~/Library/LaunchAgents.
+static NSString *const kLoginItemPlistName = @"com.jitouch.Jitouch.agent.plist";
+static NSString *const kLegacyAgentPlistPath = @"~/Library/LaunchAgents/com.jitouch.Jitouch.plist";
+
+- (SMAppService *)loginItem {
+    return [SMAppService agentServiceWithPlistName:kLoginItemPlistName];
+}
+
+- (BOOL)isRunningAsLoginItem {
+    const char *service = getenv("XPC_SERVICE_NAME");
+    return service != NULL && strcmp(service, "com.jitouch.Jitouch.agent") == 0;
+}
+
+// Jitouch is meant to run as the launch agent from Contents/Library/LaunchAgents, so
+// launchd keeps it alive and restarts it at login. When something else started this
+// instance (the preference pane or Finder), register the agent and let launchd take
+// over instead of running two copies side by side.
+- (void)handOffToLoginItem {
+    if ([self isRunningAsLoginItem]) {
+        return;
+    }
+    SMAppService *service = [self loginItem];
+    // A bundle that was updated in place keeps its registration in the background
+    // item database, so clear it before registering again.
+    [service unregisterAndReturnError:NULL];
+    NSError *error = nil;
+    if (![service registerAndReturnError:&error]) {
+        NSLog(@"Could not register the login item: %@", error);
+        return;
+    }
+    [self removeLegacyLoginItem];
+    exit(EXIT_SUCCESS);
+}
+
+- (void)removeLegacyLoginItem {
+    NSString *path = [kLegacyAgentPlistPath stringByExpandingTildeInPath];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+    }
+}
+
+- (void)unregisterLoginItem {
+    NSError *error = nil;
+    if (![[self loginItem] unregisterAndReturnError:&error]) {
+        NSLog(@"Could not unregister the login item: %@", error);
+    }
 }
 
 #pragma mark - Menu
@@ -105,7 +149,9 @@ CGKeyCode keyMap[128]; // for dvorak support
 
 
 - (void)quit:(id)sender {
-    [self unloadJitouchLaunchAgent];
+    // Unregistering stops the agent through launchd, so the process ends here and
+    // Jitouch stays stopped until it is launched again.
+    [self unregisterLoginItem];
 
     // Quit
     [NSApp terminate: sender];
@@ -245,6 +291,8 @@ void languageChanged(CFNotificationCenterRef center, void *observer, CFStringRef
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     [Settings loadSettings];
+
+    [self handOffToLoginItem];
 
     [self refreshMenu];
 

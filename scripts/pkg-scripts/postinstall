@@ -1,0 +1,14 @@
+#!/bin/bash
+#
+# Previous versions installed ~/Library/LaunchAgents/com.jitouch.Jitouch.plist and
+# let it start Jitouch. Stop that job and quit the running copy, so the preference
+# pane starts the newly installed binary, which registers itself with SMAppService.
+set -e
+
+console_user=$(stat -f%u /dev/console 2>/dev/null || true)
+if [ -n "$console_user" ] && [ "$console_user" != "0" ]; then
+    launchctl asuser "$console_user" /bin/launchctl bootout "gui/$console_user/com.jitouch.Jitouch.agent" >/dev/null 2>&1 || true
+    launchctl asuser "$console_user" /usr/bin/pkill -x Jitouch >/dev/null 2>&1 || true
+fi
+
+exit 0
