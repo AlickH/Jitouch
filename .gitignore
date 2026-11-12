@@ -4,3 +4,5 @@ xcuserdata
 /build
 .DS_Store
 /prefpane/build
+dist/
+/build-*
